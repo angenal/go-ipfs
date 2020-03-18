@@ -1,6 +1,8 @@
 package dagcmd
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -14,9 +16,15 @@ import (
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	files "github.com/ipfs/go-ipfs-files"
 	ipld "github.com/ipfs/go-ipld-format"
+	mdag "github.com/ipfs/go-merkledag"
 	ipfspath "github.com/ipfs/go-path"
 	path "github.com/ipfs/interface-go-ipfs-core/path"
 	mh "github.com/multiformats/go-multihash"
+
+	gocar "github.com/ipld/go-car"
+	gipfree "github.com/ipld/go-ipld-prime/impl/free"
+	gipselector "github.com/ipld/go-ipld-prime/traversal/selector"
+	gipselectorbuilder "github.com/ipld/go-ipld-prime/traversal/selector/builder"
 )
 
 var DagCmd = &cmds.Command{
@@ -33,6 +41,7 @@ to deprecate and replace the existing 'ipfs object' command moving forward.
 		"put":     DagPutCmd,
 		"get":     DagGetCmd,
 		"resolve": DagResolveCmd,
+		"export":  DagExportCmd,
 	},
 }
 
@@ -240,4 +249,87 @@ var DagResolveCmd = &cmds.Command{
 		}),
 	},
 	Type: ResolveOutput{},
+}
+
+var DagExportCmd = &cmds.Command{
+	Helptext: cmds.HelpText{
+		// Q: Is this a correct description? do we stream "on stdout" or do we say something else?
+		Tagline: "Streams the selected DAG as a .car stream on stdout.",
+		ShortDescription: `
+'ipfs dag export' fetches a dag and streams it out as a well-formed .car file.
+`,
+	},
+	Arguments: []cmds.Argument{
+		// Q: Is this the right way to pull in a CID from both arg and STDIN?
+		// Q: Is the "variadic false" the right way to say "just one right now"
+		// Q: Is this sufficiently "future proof" for plugging proper at the same spot?
+		cmds.StringArg("ref", true, false, "The root CID of the dag to export").EnableStdin(),
+	},
+	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
+		node, err := cmdenv.GetNode(env)
+		if err != nil {
+			return err
+		}
+
+		api, err := cmdenv.GetApi(env, req)
+		if err != nil {
+			return err
+		}
+
+		rp, err := api.ResolvePath(req.Context, path.New(req.Arguments[0]))
+		if err != nil {
+			return err
+		}
+
+		sb := gipselectorbuilder.NewSelectorSpecBuilder(gipfree.NodeBuilder())
+
+		car := gocar.NewSelectiveCar(
+			req.Context,
+			node.Blockstore,
+			[]gocar.Dag{gocar.Dag{
+				Root:     rp.Cid(),
+				Selector: sb.ExploreRecursive(gipselector.RecursionLimitNone(), sb.ExploreAll(sb.ExploreRecursiveEdge())).Node(),
+			}},
+		)
+
+		// Lock the blockstore so blocks do not disappear on us while exporting
+		unlocker := node.Blockstore.GCLock()
+		if unlocker == nil {
+			return errors.New("unable to obtain GC lock")
+		}
+		// Q: Is it correct to ignore the Unlock error - is there something I can do with it?
+		defer func() { unlocker.Unlock() }()
+
+		// Q: is this really the best we can do?
+		//
+		// Force a full graph fetch before exporting
+		// Extraordinarely inefficient ( no chance for streaming )
+		// but NewSelectiveCar only takes a blockstore...
+		//
+		// Q: how can I properly determine if I am online, and augment the error:
+		// instead of saying `Error: merkledag: not found`
+		// to do something like `Error: merkledag: not found ( node is currently offline )`
+		if err := mdag.FetchGraph(req.Context, rp.Cid(), node.DAG); err != nil {
+			return err
+		}
+
+		// Q: I wrote this *before* you answered about io.pipe
+		// Is there anything to gain by switching to io.pipe ( and paying for an extra goroutine )
+		// or is this an acceptable/idiomatic way to stream out?
+		// ( the Emit()ter seems async already )
+		var cbwriter writeCallback = func(p []byte) (int, error) {
+			if err := res.Emit(bytes.NewReader(p)); err != nil {
+				return 0, err
+			}
+			return len(p), nil
+		}
+
+		return car.Write(&cbwriter)
+	},
+}
+
+type writeCallback func([]byte) (int, error)
+
+func (c *writeCallback) Write(p []byte) (int, error) {
+	return (*c)(p)
 }
